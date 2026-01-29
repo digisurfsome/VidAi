@@ -286,8 +286,3 @@ Use these test card numbers in Stripe test mode:
 
 ---
 
-## License
-
-Copyright (c) 2025 Martin Crumlish. All rights reserved.
-
-This software is proprietary and not open source. Unauthorized copying, modification, distribution, or use of this software is strictly prohibited.
