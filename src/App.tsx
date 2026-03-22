@@ -21,6 +21,7 @@ import GeneratePage from "./pages/GeneratePage";
 import SettingsPage from "./pages/SettingsPage";
 import ProfilePage from "./pages/ProfilePage";
 import AdminDashboard from "./pages/admin/AdminDashboard";
+import BuildProgressPage from "./pages/BuildProgressPage";
 import PricingPage from "./pages/PricingPage";
 import TransactionsPage from "./pages/TransactionsPage";
 import BillingDashboard from "./pages/BillingDashboard";
@@ -82,7 +83,8 @@ const App = () => {
             <Route path="/dashboard/profile" element={<ProfilePage />} />
             <Route path="/dashboard/transactions" element={<TransactionsPage />} />
             <Route path="/dashboard/billing" element={<BillingDashboard />} />
-            <Route 
+            <Route path="/dashboard/build/:buildId" element={<BuildProgressPage />} />
+            <Route
               path="/dashboard/admin" 
               element={
                 <ProtectedRoute requireAdmin>

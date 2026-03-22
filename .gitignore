@@ -46,8 +46,8 @@ stripe.bat
 # Tests (internal)
 tests/
 
-# Internal docs
-docs/
+# Internal docs (tracked — contains product specs)
+# docs/
 
 # Internal plans
 plans/

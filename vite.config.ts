@@ -48,7 +48,12 @@ const apiPlugin = () => {
           '/credit-purchase': 'credit-purchase.ts',
           '/test-stripe-sync': 'test-stripe-sync.ts',
           '/stripe-checkout-new-user': 'stripe-checkout-new-user.ts',
-          '/stripe-success-handler': 'stripe-success-handler.ts'
+          '/stripe-success-handler': 'stripe-success-handler.ts',
+          '/build-jobs': 'build-jobs.ts',
+          '/build-events': 'build-events.ts',
+          '/app-secrets': 'app-secrets.ts',
+          '/deploy': 'deploy.ts',
+          '/build-analytics': 'build-analytics.ts'
         };
         
         // Parse URL to get path without query parameters
