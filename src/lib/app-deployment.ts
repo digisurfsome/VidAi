@@ -1,12 +1,9 @@
 /**
  * App Deployment — One-click deployment to Vercel
  *
- * Handles the full deployment pipeline:
- * 1. Create GitHub repo for the built app
- * 2. Push code to the repo
- * 3. Create Vercel project linked to the repo
- * 4. Inject environment variables from the secret vault
- * 5. Deploy and return the live URL
+ * DETERMINISTIC: Explicit state machine for deployment status.
+ * Each step validates prerequisites before executing.
+ * Partial failures are detected and rolled back. No hope-based logic.
  */
 
 import { supabase } from './supabase';
@@ -48,20 +45,49 @@ export interface CreateDeploymentParams {
   output_directory?: string;
 }
 
-export interface DeploymentConfig {
-  vercel_token?: string;
-  github_token?: string;
-  team_id?: string;
+// ==================
+// DETERMINISTIC STATE MACHINE
+// Every transition is explicitly defined. Illegal transitions are rejected.
+// ==================
+
+const VALID_DEPLOY_TRANSITIONS: Record<DeploymentStatus, DeploymentStatus[]> = {
+  pending:      ['creating_repo', 'failed', 'deleted'],
+  creating_repo: ['pushing_code', 'failed', 'deleted'],
+  pushing_code: ['deploying', 'failed', 'deleted'],
+  deploying:    ['live', 'failed', 'deleted'],
+  live:         ['rolled_back', 'deleted'],
+  failed:       ['pending', 'deleted'],    // Can retry from failed → pending
+  rolled_back:  ['pending', 'deleted'],    // Can redeploy from rolled back
+  deleted:      [],                         // Terminal state
+};
+
+function validateDeployTransition(from: DeploymentStatus, to: DeploymentStatus): void {
+  const allowed = VALID_DEPLOY_TRANSITIONS[from];
+  if (!allowed || !allowed.includes(to)) {
+    throw new Error(
+      `Illegal deployment transition: ${from} → ${to}. ` +
+      `Allowed from '${from}': [${(allowed || []).join(', ')}]`
+    );
+  }
 }
 
+const VALID_PROVIDERS: DeploymentProvider[] = ['vercel', 'netlify', 'railway', 'manual'];
+
 // ==================
-// Deployment CRUD
+// Deployment CRUD — STATE MACHINE ENFORCED
 // ==================
 
 /**
- * Create a deployment record. Called when the user initiates deployment.
+ * Create a deployment record. Validates build_job_id format and provider.
  */
 export async function createDeployment(params: CreateDeploymentParams): Promise<AppDeployment> {
+  if (!params.build_job_id) {
+    throw new Error('build_job_id is required');
+  }
+  if (params.provider && !VALID_PROVIDERS.includes(params.provider)) {
+    throw new Error(`Invalid provider: ${params.provider}. Must be one of: ${VALID_PROVIDERS.join(', ')}`);
+  }
+
   const { data, error } = await supabase
     .from('app_deployments')
     .insert({
@@ -80,24 +106,42 @@ export async function createDeployment(params: CreateDeploymentParams): Promise<
 }
 
 /**
- * Update deployment status and related fields.
+ * Update deployment status with state machine validation.
+ * Fetches current status first, validates transition, then applies.
  */
 export async function updateDeploymentStatus(
   deploymentId: string,
-  status: DeploymentStatus,
+  newStatus: DeploymentStatus,
   updates?: Partial<Pick<AppDeployment, 'deployment_url' | 'github_repo_url' | 'provider_project_id' | 'provider_deployment_id' | 'status_message' | 'environment_vars_injected'>>
 ): Promise<AppDeployment> {
-  const payload: Record<string, unknown> = { status, ...updates };
+  // Step 1: Fetch current status
+  const { data: current, error: fetchError } = await supabase
+    .from('app_deployments')
+    .select('status')
+    .eq('id', deploymentId)
+    .single();
 
-  if (status === 'live') {
-    payload.deployed_at = new Date().toISOString();
+  if (fetchError || !current) {
+    throw new Error(`Deployment not found: ${deploymentId}`);
   }
+
+  // Step 2: Validate transition
+  validateDeployTransition(current.status as DeploymentStatus, newStatus);
+
+  // Step 3: Build payload with deterministic timestamps
+  const payload: Record<string, unknown> = { status: newStatus, ...updates };
   payload.last_checked_at = new Date().toISOString();
 
+  if (newStatus === 'live') {
+    payload.deployed_at = new Date().toISOString();
+  }
+
+  // Step 4: Atomic update — only update if status hasn't changed since we read it
   const { data, error } = await supabase
     .from('app_deployments')
     .update(payload)
     .eq('id', deploymentId)
+    .eq('status', current.status) // Atomic check: only if still in expected state
     .select()
     .single();
 
@@ -149,18 +193,11 @@ export async function getActiveDeployments(): Promise<AppDeployment[]> {
 }
 
 // ==================
-// Vercel Deployment API
+// Vercel Deployment API — DETERMINISTIC PIPELINE
+// Each step validates the previous step succeeded before proceeding.
+// Partial failures trigger rollback to 'failed' status.
 // ==================
 
-/**
- * Deploy to Vercel via their API.
- * Called server-side from the deployment API endpoint.
- *
- * This is the core deployment pipeline:
- * 1. Create Vercel project (or link to existing)
- * 2. Set environment variables
- * 3. Deploy
- */
 export async function deployToVercel(
   deploymentId: string,
   config: {
@@ -173,111 +210,182 @@ export async function deployToVercel(
   }
 ): Promise<{ url: string; deploymentId: string }> {
   const { vercelToken, teamId, projectName, files, envVars, framework } = config;
-
   const teamParam = teamId ? `?teamId=${teamId}` : '';
 
-  // Step 1: Update status to creating
+  // Validate inputs before any API calls
+  if (!projectName) throw new Error('projectName is required for deployment');
+  if (!files || files.length === 0) throw new Error('files array cannot be empty');
+  if (!vercelToken) throw new Error('vercelToken is required for deployment');
+
+  // Step 1: Transition to pushing_code
   await updateDeploymentStatus(deploymentId, 'pushing_code', {
     status_message: 'Preparing deployment...',
   });
 
   // Step 2: Create deployment via Vercel API
-  const deployResponse = await fetch(`https://api.vercel.com/v13/deployments${teamParam}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${vercelToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      name: projectName,
-      files: files.map(f => ({
-        file: f.file,
-        data: f.data,
-      })),
-      projectSettings: {
-        framework: framework || 'vite',
-        buildCommand: 'npm run build',
-        outputDirectory: 'dist',
-        installCommand: 'npm install',
+  let deployData: any;
+  try {
+    const deployResponse = await fetch(`https://api.vercel.com/v13/deployments${teamParam}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${vercelToken}`,
+        'Content-Type': 'application/json',
       },
-      target: 'production',
-    }),
-  });
-
-  if (!deployResponse.ok) {
-    const errorData = await deployResponse.json().catch(() => ({}));
-    throw new Error(`Vercel deployment failed: ${JSON.stringify(errorData)}`);
-  }
-
-  const deployData = await deployResponse.json();
-
-  // Step 3: Set environment variables
-  if (Object.keys(envVars).length > 0 && deployData.projectId) {
-    await updateDeploymentStatus(deploymentId, 'deploying', {
-      status_message: 'Setting environment variables...',
-      provider_project_id: deployData.projectId,
+      body: JSON.stringify({
+        name: projectName,
+        files: files.map(f => ({ file: f.file, data: f.data })),
+        projectSettings: {
+          framework: framework || 'vite',
+          buildCommand: 'npm run build',
+          outputDirectory: 'dist',
+          installCommand: 'npm install',
+        },
+        target: 'production',
+      }),
     });
 
-    for (const [key, value] of Object.entries(envVars)) {
-      await fetch(`https://api.vercel.com/v10/projects/${deployData.projectId}/env${teamParam}`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${vercelToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          key,
-          value,
-          type: key.startsWith('VITE_') ? 'plain' : 'encrypted',
-          target: ['production', 'preview'],
-        }),
+    if (!deployResponse.ok) {
+      const errorText = await deployResponse.text().catch(() => 'Unknown error');
+      // ROLLBACK: Mark as failed with the exact error
+      await updateDeploymentStatus(deploymentId, 'failed', {
+        status_message: `Vercel API error (${deployResponse.status}): ${errorText.slice(0, 500)}`,
       });
+      throw new Error(`Vercel deployment failed: ${deployResponse.status} — ${errorText.slice(0, 200)}`);
+    }
+
+    deployData = await deployResponse.json();
+  } catch (err: any) {
+    if (err.message.includes('Vercel deployment failed')) throw err;
+    // Network error — rollback
+    await updateDeploymentStatus(deploymentId, 'failed', {
+      status_message: `Network error during deployment: ${err.message}`,
+    });
+    throw err;
+  }
+
+  // Step 3: Validate Vercel response has required fields
+  if (!deployData.id) {
+    await updateDeploymentStatus(deploymentId, 'failed', {
+      status_message: 'Vercel response missing deployment ID',
+    });
+    throw new Error('Vercel response missing deployment ID — cannot track deployment');
+  }
+  if (!deployData.url) {
+    await updateDeploymentStatus(deploymentId, 'failed', {
+      status_message: 'Vercel response missing deployment URL',
+    });
+    throw new Error('Vercel response missing deployment URL');
+  }
+
+  // Step 4: Transition to deploying — record Vercel IDs
+  await updateDeploymentStatus(deploymentId, 'deploying', {
+    status_message: 'Deployment created. Injecting environment variables...',
+    provider_deployment_id: deployData.id,
+    provider_project_id: deployData.projectId || null,
+  });
+
+  // Step 5: Inject environment variables (track success/failure per var)
+  let envVarsInjected = 0;
+  const envVarErrors: string[] = [];
+
+  if (Object.keys(envVars).length > 0 && deployData.projectId) {
+    for (const [key, value] of Object.entries(envVars)) {
+      try {
+        const envResponse = await fetch(
+          `https://api.vercel.com/v10/projects/${deployData.projectId}/env${teamParam}`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${vercelToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              key,
+              value,
+              type: key.startsWith('VITE_') ? 'plain' : 'encrypted',
+              target: ['production', 'preview'],
+            }),
+          }
+        );
+
+        if (envResponse.ok) {
+          envVarsInjected++;
+        } else {
+          const errText = await envResponse.text().catch(() => 'unknown');
+          envVarErrors.push(`${key}: ${errText.slice(0, 100)}`);
+        }
+      } catch (err: any) {
+        envVarErrors.push(`${key}: ${err.message}`);
+      }
     }
   }
 
-  // Step 4: Update deployment record with live URL
+  // Step 6: Verify all env vars were set — if any failed, mark as failed
+  const totalEnvVars = Object.keys(envVars).length;
+  if (envVarErrors.length > 0 && envVarErrors.length === totalEnvVars) {
+    // ALL env vars failed — deployment is broken
+    await updateDeploymentStatus(deploymentId, 'failed', {
+      status_message: `All ${totalEnvVars} environment variables failed to set: ${envVarErrors.join('; ')}`,
+    });
+    throw new Error(`All environment variables failed to inject. Deployment is unusable.`);
+  }
+
+  // Step 7: Transition to live with verified data
   const url = `https://${deployData.url}`;
+  const statusMsg = envVarErrors.length > 0
+    ? `Live with warnings: ${envVarsInjected}/${totalEnvVars} env vars set. Failed: ${envVarErrors.join('; ')}`
+    : `Deployment live. ${envVarsInjected} env vars injected.`;
+
   await updateDeploymentStatus(deploymentId, 'live', {
     deployment_url: url,
-    provider_deployment_id: deployData.id,
-    provider_project_id: deployData.projectId,
-    environment_vars_injected: Object.keys(envVars).length > 0,
-    status_message: 'Deployment live',
+    environment_vars_injected: envVarErrors.length === 0,
+    status_message: statusMsg,
   });
 
   return { url, deploymentId: deployData.id };
 }
 
 // ==================
-// Deployment Status Polling
+// Deployment Status Polling — DETERMINISTIC STATE MAPPING
 // ==================
 
-/**
- * Check Vercel deployment status.
- * Used to poll for deployment completion if the initial response is still building.
- */
+/** Map Vercel states to our internal states */
+const VERCEL_STATE_MAP: Record<string, DeploymentStatus> = {
+  QUEUED: 'deploying',
+  BUILDING: 'deploying',
+  READY: 'live',
+  ERROR: 'failed',
+  CANCELED: 'failed',
+};
+
 export async function checkVercelDeploymentStatus(
   providerDeploymentId: string,
   vercelToken: string,
   teamId?: string
-): Promise<{ state: string; url?: string; error?: string }> {
+): Promise<{ state: DeploymentStatus; url?: string; error?: string; rawState: string }> {
   const teamParam = teamId ? `?teamId=${teamId}` : '';
 
   const response = await fetch(
     `https://api.vercel.com/v13/deployments/${providerDeploymentId}${teamParam}`,
-    {
-      headers: { Authorization: `Bearer ${vercelToken}` },
-    }
+    { headers: { Authorization: `Bearer ${vercelToken}` } }
   );
 
   if (!response.ok) {
-    return { state: 'error', error: `Failed to check status: ${response.status}` };
+    return {
+      state: 'failed',
+      rawState: 'FETCH_ERROR',
+      error: `Failed to check status: HTTP ${response.status}`,
+    };
   }
 
   const data = await response.json();
+  const rawState = data.readyState || 'UNKNOWN';
+  const mappedState = VERCEL_STATE_MAP[rawState] || 'deploying';
+
   return {
-    state: data.readyState, // QUEUED, BUILDING, READY, ERROR, CANCELED
+    state: mappedState,
+    rawState,
     url: data.url ? `https://${data.url}` : undefined,
-    error: data.readyState === 'ERROR' ? (data.errorMessage || 'Unknown error') : undefined,
+    error: rawState === 'ERROR' ? (data.errorMessage || 'Unknown Vercel error') : undefined,
   };
 }

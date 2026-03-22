@@ -54,8 +54,12 @@ export default async function handler(req: any, res: any) {
         return res.status(404).json({ error: 'Build not found' });
       }
 
-      if (build.status !== 'complete' && build.status !== 'deploying') {
-        return res.status(400).json({ error: 'Build must be complete before deployment' });
+      // DETERMINISTIC: Only 'complete' builds can be deployed. No exceptions.
+      if (build.status !== 'complete') {
+        return res.status(400).json({
+          error: `Build must be in 'complete' status to deploy. Current status: '${build.status}'.`,
+          current_status: build.status,
+        });
       }
 
       // Check for existing deployment
@@ -91,8 +95,8 @@ export default async function handler(req: any, res: any) {
 
       if (error) throw error;
 
-      // Update build status to deploying
-      await supabase
+      // Update build status to deploying — verify it succeeds
+      const { error: buildUpdateError } = await supabase
         .from('build_jobs')
         .update({
           status: 'deploying',
@@ -101,8 +105,14 @@ export default async function handler(req: any, res: any) {
         })
         .eq('id', build_job_id);
 
-      // Emit deployment start event
-      await supabase
+      if (buildUpdateError) {
+        // Rollback: delete the deployment record we just created
+        await supabase.from('app_deployments').delete().eq('id', data.id);
+        throw new Error(`Failed to update build status: ${buildUpdateError.message}`);
+      }
+
+      // Emit deployment start event — verify it succeeds
+      const { error: eventError } = await supabase
         .from('build_events')
         .insert({
           build_job_id,
@@ -111,6 +121,11 @@ export default async function handler(req: any, res: any) {
           phase_name: 'Deployment',
           message: `Initiating ${provider || 'Vercel'} deployment...`,
         });
+
+      if (eventError) {
+        console.error('Failed to emit deploy_start event:', eventError.message);
+        // Non-fatal: deployment can proceed without event logging
+      }
 
       return res.status(201).json({ deployment: data, created: true });
     }

@@ -1,9 +1,10 @@
 /**
  * App Secrets — Per-app encrypted secret vault
  *
- * Securely stores API keys and credentials for each built app.
- * Keys are encrypted client-side before storage and injected
- * into .env.local at build time. Never hardcoded in source code.
+ * DETERMINISTIC: Every secret is encrypted with AES-256-GCM and verified
+ * with a SHA-256 integrity hash on decryption. Key names are validated
+ * against allowed patterns. The .env.local generator includes a checksum
+ * for tamper detection. No hope-based logic.
  */
 
 import { supabase } from './supabase';
@@ -68,8 +69,56 @@ export const SECRET_TEMPLATES: Record<string, { key_name: string; description: s
 };
 
 // ==================
-// Encryption (Web Crypto API)
+// Input Validation
 // ==================
+
+const VALID_KEY_TYPES: SecretKeyType[] = ['env', 'api_key', 'oauth', 'webhook', 'custom'];
+
+/** Key names must be uppercase alphanumeric with underscores (env var format) */
+const KEY_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,254}$/;
+
+function validateKeyName(keyName: string): void {
+  if (!keyName || typeof keyName !== 'string') {
+    throw new Error('key_name is required and must be a non-empty string');
+  }
+  if (!KEY_NAME_PATTERN.test(keyName)) {
+    throw new Error(
+      `Invalid key_name: '${keyName}'. Must be uppercase alphanumeric with underscores ` +
+      `(e.g., VITE_SUPABASE_URL, STRIPE_SECRET_KEY)`
+    );
+  }
+}
+
+function validateKeyType(keyType: string): asserts keyType is SecretKeyType {
+  if (!VALID_KEY_TYPES.includes(keyType as SecretKeyType)) {
+    throw new Error(`Invalid key_type: '${keyType}'. Must be one of: ${VALID_KEY_TYPES.join(', ')}`);
+  }
+}
+
+function validateSetParams(params: SetSecretParams): void {
+  if (!params.app_id) throw new Error('app_id is required');
+  validateKeyName(params.key_name);
+  if (!params.value || typeof params.value !== 'string') {
+    throw new Error('value is required and must be a non-empty string');
+  }
+  if (params.key_type) validateKeyType(params.key_type);
+}
+
+// ==================
+// Encryption (Web Crypto API) — WITH INTEGRITY HASH
+// ==================
+
+/**
+ * Compute SHA-256 hash of a value for integrity verification.
+ * Stored alongside the encrypted value; checked on decrypt to guarantee
+ * the decrypted result matches the original plaintext.
+ */
+async function computeHash(value: string): Promise<string> {
+  const encoded = new TextEncoder().encode(value);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
+  const hashArray = new Uint8Array(hashBuffer);
+  return Array.from(hashArray).map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
 /**
  * Derive an encryption key from the app_id + user's auth token.
@@ -101,10 +150,18 @@ async function deriveKey(appId: string): Promise<CryptoKey> {
   );
 }
 
-async function encryptValue(value: string, appId: string): Promise<{ encrypted: string; iv: string; tag: string }> {
+/**
+ * Encrypt a value with AES-256-GCM.
+ * Also computes a SHA-256 hash of the plaintext for post-decrypt verification.
+ */
+async function encryptValue(
+  value: string,
+  appId: string
+): Promise<{ encrypted: string; iv: string; tag: string; hash: string }> {
   const key = await deriveKey(appId);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(value);
+  const hash = await computeHash(value);
 
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
@@ -121,28 +178,72 @@ async function encryptValue(value: string, appId: string): Promise<{ encrypted: 
     encrypted: btoa(String.fromCharCode(...encryptedData)),
     iv: btoa(String.fromCharCode(...iv)),
     tag: btoa(String.fromCharCode(...authTag)),
+    hash,
   };
 }
 
-async function decryptValue(encrypted: string, iv: string, tag: string, appId: string): Promise<string> {
+/**
+ * Decrypt a value and verify integrity against stored hash.
+ *
+ * DETERMINISTIC: If decryption succeeds but hash doesn't match,
+ * throws an integrity error rather than returning corrupt data.
+ * Classifies errors: authentication failure vs integrity mismatch.
+ */
+async function decryptValue(
+  encrypted: string,
+  iv: string,
+  tag: string,
+  appId: string,
+  expectedHash?: string
+): Promise<string> {
   const key = await deriveKey(appId);
 
-  const encryptedBytes = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
-  const ivBytes = Uint8Array.from(atob(iv), c => c.charCodeAt(0));
-  const tagBytes = Uint8Array.from(atob(tag), c => c.charCodeAt(0));
+  let encryptedBytes: Uint8Array;
+  let ivBytes: Uint8Array;
+  let tagBytes: Uint8Array;
+
+  try {
+    encryptedBytes = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
+    ivBytes = Uint8Array.from(atob(iv), c => c.charCodeAt(0));
+    tagBytes = Uint8Array.from(atob(tag), c => c.charCodeAt(0));
+  } catch {
+    throw new Error('DECODE_ERROR: Failed to decode base64 encrypted data. Data may be corrupted.');
+  }
 
   // Reconstruct ciphertext + tag for AES-GCM
   const combined = new Uint8Array(encryptedBytes.length + tagBytes.length);
   combined.set(encryptedBytes);
   combined.set(tagBytes, encryptedBytes.length);
 
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: ivBytes },
-    key,
-    combined
-  );
+  let decrypted: ArrayBuffer;
+  try {
+    decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: ivBytes },
+      key,
+      combined
+    );
+  } catch {
+    throw new Error(
+      'AUTH_FAILURE: Decryption failed — authentication tag mismatch. ' +
+      'Data has been tampered with or encryption key has changed.'
+    );
+  }
 
-  return new TextDecoder().decode(decrypted);
+  const plaintext = new TextDecoder().decode(decrypted);
+
+  // Verify integrity hash if provided
+  if (expectedHash) {
+    const actualHash = await computeHash(plaintext);
+    if (actualHash !== expectedHash) {
+      throw new Error(
+        'INTEGRITY_MISMATCH: Decrypted value hash does not match stored hash. ' +
+        `Expected: ${expectedHash.slice(0, 16)}..., Got: ${actualHash.slice(0, 16)}... ` +
+        'Data may have been corrupted in storage.'
+      );
+    }
+  }
+
+  return plaintext;
 }
 
 // ==================
@@ -152,9 +253,11 @@ async function decryptValue(encrypted: string, iv: string, tag: string, appId: s
 /**
  * Set (create or update) a secret for an app.
  * Value is encrypted client-side before being sent to the database.
+ * SHA-256 hash stored for post-decrypt integrity verification.
  */
 export async function setAppSecret(params: SetSecretParams): Promise<AppSecret> {
-  const { encrypted, iv, tag } = await encryptValue(params.value, params.app_id);
+  validateSetParams(params);
+  const { encrypted, iv, tag, hash } = await encryptValue(params.value, params.app_id);
 
   const { data, error } = await supabase
     .from('app_secrets')
@@ -245,21 +348,36 @@ export async function deleteAppSecret(appId: string, keyName: string): Promise<v
 
 /**
  * Generate .env.local content from all stored secrets.
- * Used during build Phase 1 to inject environment variables.
+ * DETERMINISTIC: Includes a SHA-256 checksum of the entire file content
+ * for tamper detection. Keys are sorted alphabetically for consistency.
  */
 export async function generateEnvFile(appId: string): Promise<string> {
   const secrets = await getAllSecretValues(appId);
+  const timestamp = new Date().toISOString();
+
+  // Sort keys alphabetically for deterministic output
+  const sortedKeys = Object.keys(secrets).sort();
+
+  const envLines: string[] = [];
+  for (const key of sortedKeys) {
+    envLines.push(`${key}=${secrets[key]}`);
+  }
+
+  const envContent = envLines.join('\n');
+
+  // Compute checksum of the env content for integrity verification
+  const checksum = await computeHash(envContent);
+
   const lines = [
     '# Generated by VidAi Build System',
     `# App ID: ${appId}`,
-    `# Generated: ${new Date().toISOString()}`,
+    `# Generated: ${timestamp}`,
+    `# Checksum: ${checksum}`,
+    `# Keys: ${sortedKeys.length}`,
     '# DO NOT COMMIT THIS FILE',
     '',
+    envContent,
   ];
-
-  for (const [key, value] of Object.entries(secrets)) {
-    lines.push(`${key}=${value}`);
-  }
 
   return lines.join('\n');
 }

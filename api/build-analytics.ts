@@ -191,11 +191,50 @@ export default async function handler(req: any, res: any) {
       return res.status(400).json({ error: 'Invalid type. Use: summary, timeseries, avg-delivery' });
     }
 
-    // POST — Record analytics (system only)
+    // POST — Record analytics (system only, validated)
     if (req.method === 'POST') {
+      const body = req.body;
+
+      // Validate required field
+      if (!body.build_job_id) {
+        return res.status(400).json({ error: 'build_job_id is required' });
+      }
+
+      // Validate numeric ranges — no negative durations
+      const durationFields = ['total_duration_ms', 'phase_1_duration_ms', 'phase_2_duration_ms',
+        'phase_3_duration_ms', 'phase_4_duration_ms', 'queue_wait_ms', 'deployment_duration_ms'];
+      for (const field of durationFields) {
+        if (body[field] !== undefined && (typeof body[field] !== 'number' || body[field] < 0)) {
+          return res.status(400).json({ error: `${field} must be a non-negative number` });
+        }
+      }
+
+      // Validate test counts — passed cannot exceed total
+      if (body.phase_2_tests_passed !== undefined && body.phase_2_test_count !== undefined) {
+        if (body.phase_2_tests_passed > body.phase_2_test_count) {
+          return res.status(400).json({
+            error: `phase_2_tests_passed (${body.phase_2_tests_passed}) cannot exceed phase_2_test_count (${body.phase_2_test_count})`
+          });
+        }
+      }
+      if (body.phase_3_interactions_passed !== undefined && body.phase_3_interactions_tested !== undefined) {
+        if (body.phase_3_interactions_passed > body.phase_3_interactions_tested) {
+          return res.status(400).json({
+            error: `phase_3_interactions_passed (${body.phase_3_interactions_passed}) cannot exceed phase_3_interactions_tested (${body.phase_3_interactions_tested})`
+          });
+        }
+      }
+
+      // Validate visual score range
+      if (body.phase_3_visual_score !== undefined) {
+        if (body.phase_3_visual_score < 0 || body.phase_3_visual_score > 100) {
+          return res.status(400).json({ error: 'phase_3_visual_score must be between 0 and 100' });
+        }
+      }
+
       const { data, error } = await supabase
         .from('build_analytics')
-        .insert(req.body)
+        .insert(body)
         .select()
         .single();
 

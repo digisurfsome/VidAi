@@ -45,6 +45,16 @@ export default async function handler(req: any, res: any) {
         return res.status(400).json({ error: 'idempotency_key and app_name are required' });
       }
 
+      // Validate enum values deterministically
+      const validPriorities = ['low', 'standard', 'high', 'critical'];
+      const validComplexity = ['simple', 'standard', 'complex', 'enterprise'];
+      if (priority && !validPriorities.includes(priority)) {
+        return res.status(400).json({ error: `Invalid priority: ${priority}. Must be one of: ${validPriorities.join(', ')}` });
+      }
+      if (complexity_tier && !validComplexity.includes(complexity_tier)) {
+        return res.status(400).json({ error: `Invalid complexity_tier: ${complexity_tier}. Must be one of: ${validComplexity.join(', ')}` });
+      }
+
       // Check for existing build with same idempotency key
       const { data: existing } = await supabase
         .from('build_jobs')
@@ -147,13 +157,57 @@ export default async function handler(req: any, res: any) {
         return res.status(400).json({ error: 'id and status are required' });
       }
 
+      // Validate new status is a valid value
+      const validStatuses = ['queued', 'building', 'testing', 'deploying', 'complete', 'failed', 'cancelled'];
+      if (!validStatuses.includes(newStatus)) {
+        return res.status(400).json({ error: `Invalid status: ${newStatus}. Must be one of: ${validStatuses.join(', ')}` });
+      }
+
+      // Fetch current build to validate transition server-side
+      const { data: currentBuild } = await supabase
+        .from('build_jobs')
+        .select('status, current_phase')
+        .eq('id', id)
+        .single();
+
+      if (!currentBuild) {
+        return res.status(404).json({ error: 'Build not found' });
+      }
+
+      // Validate state machine transition
+      const validTransitions: Record<string, string[]> = {
+        queued: ['building', 'cancelled', 'failed'],
+        building: ['testing', 'failed', 'cancelled'],
+        testing: ['deploying', 'failed', 'cancelled'],
+        deploying: ['complete', 'failed', 'cancelled'],
+        complete: [],
+        failed: ['building'],
+        cancelled: [],
+      };
+
+      const allowed = validTransitions[currentBuild.status] || [];
+      if (!allowed.includes(newStatus)) {
+        return res.status(400).json({
+          error: `Illegal status transition: ${currentBuild.status} → ${newStatus}. Allowed: [${allowed.join(', ')}]`
+        });
+      }
+
+      // Validate phase progression (no regression except on retry)
+      if (current_phase !== undefined && current_phase < currentBuild.current_phase) {
+        if (!(currentBuild.status === 'failed' && newStatus === 'building')) {
+          return res.status(400).json({
+            error: `Phase regression not allowed: ${currentBuild.current_phase} → ${current_phase}`
+          });
+        }
+      }
+
       const updates: Record<string, unknown> = { status: newStatus };
       if (current_phase !== undefined) updates.current_phase = current_phase;
       if (current_phase_name) updates.current_phase_name = current_phase_name;
       if (progress_percentage !== undefined) updates.progress_percentage = progress_percentage;
       if (error_context) updates.error_context = error_context;
-      if (newStatus === 'building') updates.started_at = new Date().toISOString();
-      if (newStatus === 'complete' || newStatus === 'failed') updates.completed_at = new Date().toISOString();
+      if (newStatus === 'building' && currentBuild.status === 'queued') updates.started_at = new Date().toISOString();
+      if (newStatus === 'complete' || newStatus === 'failed' || newStatus === 'cancelled') updates.completed_at = new Date().toISOString();
 
       const { data, error } = await supabase
         .from('build_jobs')

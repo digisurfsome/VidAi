@@ -1,8 +1,9 @@
 /**
  * Build Delivery — Receipt generation and delivery management
  *
- * Generates structured delivery receipts with integrity manifests,
- * test results, and artifact links. Ties into the Build Integrity System.
+ * DETERMINISTIC: Manifest hash is mandatory — no receipt without proof.
+ * Test counts are validated (passed <= total). Routes structure is
+ * verified. Receipt format is consistent and reproducible.
  */
 
 import { supabase } from './supabase';
@@ -81,10 +82,71 @@ export interface CreateDeliveryParams {
 // ==================
 
 /**
+ * Validate delivery receipt params.
+ * DETERMINISTIC: Rejects invalid data rather than silently accepting it.
+ */
+function validateDeliveryParams(params: CreateDeliveryParams): void {
+  if (!params.build_job_id) throw new Error('build_job_id is required');
+  if (!params.app_name || typeof params.app_name !== 'string') {
+    throw new Error('app_name is required and must be a non-empty string');
+  }
+  if (!Array.isArray(params.tech_stack) || params.tech_stack.length === 0) {
+    throw new Error('tech_stack is required and must be a non-empty array');
+  }
+  if (typeof params.files_delivered !== 'number' || params.files_delivered < 0) {
+    throw new Error('files_delivered must be a non-negative number');
+  }
+
+  // Test count validation — passed can never exceed total
+  if (typeof params.tests_passed !== 'number' || params.tests_passed < 0) {
+    throw new Error('tests_passed must be a non-negative number');
+  }
+  if (typeof params.tests_total !== 'number' || params.tests_total < 0) {
+    throw new Error('tests_total must be a non-negative number');
+  }
+  if (params.tests_passed > params.tests_total) {
+    throw new Error(
+      `Test count invalid: tests_passed (${params.tests_passed}) cannot exceed ` +
+      `tests_total (${params.tests_total})`
+    );
+  }
+
+  // Visual QA score must be 0-100
+  if (params.visual_qa_score !== undefined) {
+    if (typeof params.visual_qa_score !== 'number' || params.visual_qa_score < 0 || params.visual_qa_score > 100) {
+      throw new Error('visual_qa_score must be between 0 and 100');
+    }
+  }
+
+  // Manifest hash is mandatory — no receipt without proof
+  if (!params.manifest_hash || typeof params.manifest_hash !== 'string') {
+    throw new Error(
+      'manifest_hash is required for delivery receipts. ' +
+      'Every delivery must have a cryptographic manifest for the Build Guarantee.'
+    );
+  }
+
+  // Routes structure validation
+  if (params.routes) {
+    if (typeof params.routes !== 'object') {
+      throw new Error('routes must be an object with public, authenticated, and admin arrays');
+    }
+    for (const key of ['public', 'authenticated', 'admin'] as const) {
+      if (params.routes[key] !== undefined && !Array.isArray(params.routes[key])) {
+        throw new Error(`routes.${key} must be an array of route strings`);
+      }
+    }
+  }
+}
+
+/**
  * Create a delivery receipt for a completed build.
- * Called automatically when a build passes all phases.
+ * DETERMINISTIC: All inputs validated. Manifest hash mandatory.
+ * Test counts verified. Routes structure checked.
  */
 export async function createDeliveryReceipt(params: CreateDeliveryParams): Promise<BuildDelivery> {
+  validateDeliveryParams(params);
+
   const { data, error } = await supabase
     .from('build_deliveries')
     .insert({
@@ -96,9 +158,9 @@ export async function createDeliveryReceipt(params: CreateDeliveryParams): Promi
       features_included: params.features_included || null,
       tests_passed: params.tests_passed,
       tests_total: params.tests_total,
-      visual_qa_score: params.visual_qa_score || null,
+      visual_qa_score: params.visual_qa_score ?? null,
       phase_results: params.phase_results || null,
-      manifest_hash: params.manifest_hash || null,
+      manifest_hash: params.manifest_hash,
       manifest_data: params.manifest_data || null,
       screenshots: params.screenshots || null,
       test_report_url: params.test_report_url || null,
