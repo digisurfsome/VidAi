@@ -395,6 +395,65 @@ Located in `supabase/migrations/`:
 - **CASCADE DELETE**: All user-related tables properly cascade delete when user is removed
 - **RLS Policies**: Service role key required for admin operations to bypass RLS
 
+## Enterprise Build System
+
+### Overview
+Six core systems powering the enterprise build pipeline. All systems share the same database migration (`00011_enterprise_build_system.sql`) and follow the same patterns.
+
+### 1. Build Jobs + Idempotency
+- **Library**: `src/lib/build-jobs.ts` — Core build tracking with idempotency keys
+- **API**: `api/build-jobs.ts` — CRUD endpoints for builds
+- **Idempotency**: Every build request requires a UUID idempotency key. Duplicate requests return existing build.
+- **Status flow**: queued → building → testing → deploying → complete/failed
+
+### 2. Real-Time Build Progress
+- **Library**: `src/lib/build-events.ts` — Event emission and Supabase Realtime subscriptions
+- **Hook**: `src/hooks/useBuildProgress.ts` — React hook for live build tracking
+- **Page**: `src/pages/BuildProgressPage.tsx` — Full progress visualization UI
+- **Route**: `/dashboard/build/:buildId`
+- **API**: `api/build-events.ts` — Event retrieval and emission
+- Uses Supabase Realtime (postgres_changes) for live event streaming
+
+### 3. Per-App Secret Vault
+- **Library**: `src/lib/app-secrets.ts` — Client-side AES-256-GCM encryption + CRUD
+- **API**: `api/app-secrets.ts` — Secret management endpoints
+- **Encryption**: Web Crypto API, keys derived from user_id + app_id via PBKDF2
+- **Templates**: Pre-defined key sets for Supabase, Stripe, Resend, OpenAI, fal.ai
+- Generates `.env.local` content at build time
+
+### 4. Build Delivery Receipt
+- **Library**: `src/lib/build-delivery.ts` — Receipt generation, plaintext + HTML formatting
+- Includes: tech stack, routes, tests passed, visual QA score, manifest hash
+- Links to Build Integrity System manifests
+- HTML email template for delivery notifications
+
+### 5. Automated Deployment (Vercel)
+- **Library**: `src/lib/app-deployment.ts` — Vercel API integration
+- **API**: `api/deploy.ts` — Deployment creation and status checking
+- Pipeline: create project → inject env vars → deploy → return live URL
+- Prevents duplicate deployments per build
+- Status polling for deployment completion
+
+### 6. Build Analytics Dashboard
+- **Library**: `src/lib/build-analytics.ts` — Metrics recording and aggregation
+- **API**: `api/build-analytics.ts` — Summary, time series, avg delivery endpoints
+- **Page**: `src/pages/admin/BuildAnalyticsDashboard.tsx` — Admin analytics UI
+- **Admin Tab**: Available in Admin Dashboard under "Build Analytics"
+- Tracks: success rate, build times, phase durations, visual scores, failure distribution
+
+### Database Tables (Migration 00011)
+- `build_jobs` — Build tracking with idempotency
+- `build_events` — Real-time progress events (Supabase Realtime)
+- `app_secrets` — Encrypted per-app secret vault
+- `build_deliveries` — Delivery receipts with manifests
+- `app_deployments` — Deployment tracking (Vercel/Netlify/Railway)
+- `build_analytics` — Build metrics for admin dashboard
+
+### Key Files
+- `/docs/MVP_ENTERPRISE_STACK.md` — Full feature roadmap (NOW vs LATER)
+- `/docs/BUILD_INTEGRITY_SYSTEM.md` — Build guarantee and integrity spec
+- `/docs/TESTING_PIPELINE_SPEC.md` — Testing pipeline (Docker + Playwright + Computer Use)
+
 ## Troubleshooting
 
 ### Common Issues and Solutions

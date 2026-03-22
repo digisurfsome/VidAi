@@ -24,7 +24,8 @@ import {
   FlaskConical,
   Package,
   RefreshCw,
-  Key
+  Key,
+  BarChart3
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import UserManagement from './UserManagement'
@@ -36,6 +37,7 @@ import StripePlanManagement from './StripePlanManagement'
 import TestModeSettings from './TestModeSettings'
 import CreditPackageManager from './CreditPackageManager'
 import SyncStatusMonitor from './SyncStatusMonitor'
+import BuildAnalyticsDashboard from './BuildAnalyticsDashboard'
 
 const AdminDashboard = () => {
   const permissions = useAdminPermissions()
@@ -212,12 +214,19 @@ const AdminDashboard = () => {
                 <FlaskConical className="h-4 w-4 mr-2" />
                 Test Mode
               </TabsTrigger>
-              <TabsTrigger 
-                value="sync" 
+              <TabsTrigger
+                value="sync"
                 className="w-full justify-start data-[state=active]:bg-muted data-[state=active]:text-foreground rounded-md px-4 py-3"
               >
                 <RefreshCw className="h-4 w-4 mr-2" />
                 Sync Status
+              </TabsTrigger>
+              <TabsTrigger
+                value="build-analytics"
+                className="w-full justify-start data-[state=active]:bg-muted data-[state=active]:text-foreground rounded-md px-4 py-3"
+              >
+                <BarChart3 className="h-4 w-4 mr-2" />
+                Build Analytics
               </TabsTrigger>
             </TabsList>
           </div>
@@ -446,6 +455,10 @@ const AdminDashboard = () => {
             {/* Sync Status Tab */}
             <TabsContent value="sync">
               <SyncStatusMonitor />
+            </TabsContent>
+
+            <TabsContent value="build-analytics">
+              <BuildAnalyticsDashboard />
             </TabsContent>
 
           </div>
