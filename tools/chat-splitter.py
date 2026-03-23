@@ -13,8 +13,8 @@ Outputs:
 """
 
 import sys
-import os
 import re
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -211,6 +211,74 @@ def merge_small_segments(segments: list[dict], min_lines: int = 2) -> list[dict]
     return final
 
 
+# ============================================================
+# DEDUPLICATION ENGINE
+# ============================================================
+
+def normalize_for_dedup(text: str) -> str:
+    """Normalize text for duplicate detection — collapse whitespace only."""
+    return re.sub(r'\s+', ' ', text.strip())
+
+
+def deduplicate_segments(segments: list[dict]) -> tuple[list[dict], int]:
+    """
+    Remove exact duplicate segments (same text after whitespace normalization).
+    Keeps the first occurrence, drops subsequent copies.
+
+    Returns: (unique_segments, count_removed)
+    """
+    if not segments:
+        return segments, 0
+
+    kept = []
+    seen = set()
+    removed_count = 0
+
+    for seg in segments:
+        block_text = normalize_for_dedup('\n'.join(l for l in seg['lines'] if l.strip()))
+        if not block_text:
+            kept.append(seg)
+            continue
+
+        fp = hashlib.md5(block_text.encode()).hexdigest()
+
+        if fp in seen:
+            removed_count += 1
+            continue
+
+        seen.add(fp)
+        kept.append(seg)
+
+    return kept, removed_count
+
+
+def deduplicate_lines_across_segments(segments: list[dict]) -> tuple[list[dict], int]:
+    """
+    Remove duplicate lines that appear across different segments.
+    This catches content that got split into different segment boundaries
+    but is actually the same text repeated.
+    Keeps first occurrence, removes subsequent copies.
+    """
+    seen_lines = set()
+    removed_count = 0
+
+    for seg in segments:
+        unique_lines = []
+        for line in seg['lines']:
+            normalized = normalize_for_dedup(line)
+            if not normalized:
+                unique_lines.append(line)  # keep blank lines
+                continue
+            if normalized in seen_lines:
+                removed_count += 1
+                continue
+            seen_lines.add(normalized)
+            unique_lines.append(line)
+        seg['lines'] = unique_lines
+
+    return segments, removed_count
+
+
 def process_file(input_path: str, out_dir: str = None):
     """Main processing function."""
     input_path = Path(input_path)
@@ -231,15 +299,26 @@ def process_file(input_path: str, out_dir: str = None):
     segments = classify_lines(lines)
     segments = merge_small_segments(segments)
 
-    # Separate
+    # Separate by type
     human_segments = [s for s in segments if s['type'] == 'human']
     ai_segments = [s for s in segments if s['type'] == 'ai']
 
+    # Deduplicate each type independently (exact matches only)
+    human_segments, human_dupes_count = deduplicate_segments(human_segments)
+    ai_segments, ai_dupes_count = deduplicate_segments(ai_segments)
+    total_dupes = human_dupes_count + ai_dupes_count
+
+    # Second-pass dedup: check individual lines across all blocks
+    # Catches duplicates that ended up in different segment groupings
+    human_segments, line_dupes_h = deduplicate_lines_across_segments(human_segments)
+    ai_segments, line_dupes_a = deduplicate_lines_across_segments(ai_segments)
+    total_dupes += line_dupes_h + line_dupes_a
+
     human_text = '\n\n--- [Block] ---\n\n'.join(
-        '\n'.join(s['lines']).strip() for s in human_segments
+        '\n'.join(s['lines']).strip() for s in human_segments if any(l.strip() for l in s['lines'])
     )
     ai_text = '\n\n--- [Block] ---\n\n'.join(
-        '\n'.join(s['lines']).strip() for s in ai_segments
+        '\n'.join(s['lines']).strip() for s in ai_segments if any(l.strip() for l in s['lines'])
     )
 
     human_line_count = sum(len([l for l in s['lines'] if l.strip()]) for s in human_segments)
@@ -271,6 +350,8 @@ def process_file(input_path: str, out_dir: str = None):
     h_pct = (human_line_count / total_classified * 100) if total_classified else 0
     a_pct = (ai_line_count / total_classified * 100) if total_classified else 0
 
+    dedup_line = f"Duplicates removed: {total_dupes} ({human_dupes_count} human, {ai_dupes_count} AI)" if total_dupes else "Duplicates removed: 0"
+
     summary = f"""Chat Splitter Summary
 ====================
 Source: {input_path.name}
@@ -279,6 +360,7 @@ Processed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Total: {total_lines:,} lines / {total_chars:,} chars
 Human rants: {human_line_count:,} lines ({len(human_segments)} blocks)
 AI responses: {ai_line_count:,} lines ({len(ai_segments)} blocks)
+{dedup_line}
 
 Split: {h_pct:.1f}% human / {a_pct:.1f}% AI
 
@@ -293,6 +375,8 @@ Output files:
     print(f"Results:")
     print(f"  Human rants:  {human_line_count:,} lines ({len(human_segments)} blocks)")
     print(f"  AI responses: {ai_line_count:,} lines ({len(ai_segments)} blocks)")
+    if total_dupes:
+        print(f"  Duplicates removed: {total_dupes} ({human_dupes_count} human, {ai_dupes_count} AI)")
     print(f"  Split: {h_pct:.1f}% human / {a_pct:.1f}% AI")
     print()
     print(f"Segment map:")
